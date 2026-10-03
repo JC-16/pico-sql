@@ -25,6 +25,10 @@ from .storage.bufferpool import BufferPool, FilePageFile, MemoryPageFile
 from .storage.catalog import load_catalog, save_catalog
 from .storage.heap import HeapTable
 from .storage.pages import PageError, new_page
+from .storage.record import encode_row
+
+INT64_MIN = -(2**63)
+INT64_MAX = 2**63 - 1
 
 
 class EngineError(Exception):
@@ -113,6 +117,13 @@ class Table:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise EngineError(
                     f"column {col.name!r} expects INT, got {type(value).__name__}"
+                )
+            if not INT64_MIN <= value <= INT64_MAX:
+                # the on-disk encoding is a signed 8-byte int; without this
+                # check an out-of-range value would explode as a raw
+                # struct.error deep inside the storage layer
+                raise EngineError(
+                    f"value {value} out of INT64 range for column {col.name!r}"
                 )
         elif col.type == "FLOAT":
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -320,7 +331,11 @@ def _execute_drop(db: "Database", stmt: ast.DropTable) -> ExecuteResult:
 def _execute_insert(db: "Database", stmt: ast.Insert) -> ExecuteResult:
     table = db._require_table(stmt.table)
     ncols = len(table.columns)
-    inserted = 0
+    pk_pos = table.col_pos(table.pk.name) if table.pk is not None else None
+
+    # Phase 1 -- validate everything, write nothing. A statement that fails
+    # anywhere (type, size, duplicate key) must leave the table untouched.
+    staged: list = []
     for row_exprs in stmt.rows:
         if stmt.columns is None:
             if len(row_exprs) != ncols:
@@ -339,16 +354,25 @@ def _execute_insert(db: "Database", stmt: ast.Insert) -> ExecuteResult:
             values[table.col_pos(col.name)] = table._coerce(
                 col, eval_expr(expr, None, table)
             )
-        if table.pk is not None:
-            pk_pos = table.col_pos(table.pk.name)
+        encode_row(table.columns, values)  # surfaces overflow / oversize NOW,
+        # not as a raw struct.error or a mid-statement storage failure
+        staged.append(values)
+    if pk_pos is not None:
+        seen: set = set()
+        for values in staged:
             pk_value = values[pk_pos]
-            if pk_value is not None and pk_value in table.pk_index:
+            if pk_value is None:
+                continue
+            if pk_value in table.pk_index or pk_value in seen:
                 raise EngineError(
                     f"duplicate primary key {pk_value!r} in table {table.name!r}"
                 )
+            seen.add(pk_value)
+
+    # Phase 2 -- commit: nothing below can fail, by construction
+    for values in staged:
         table.insert_row(values)
-        inserted += 1
-    return ExecuteResult(f"{inserted} row(s) inserted", affected=inserted)
+    return ExecuteResult(f"{len(staged)} row(s) inserted", affected=len(staged))
 
 
 def _execute_select(db: "Database", stmt: ast.Select) -> QueryResult:
@@ -384,8 +408,9 @@ def _execute_update(db: "Database", stmt: ast.Update) -> ExecuteResult:
         positions[pos] = expr
     pk_pos = table.col_pos(table.pk.name) if table.pk is not None else None
 
-    # validate every row first, then commit -- a tiny nod to atomicity that
-    # Day 4's WAL will make real
+    # Phase 1 -- validate + encode every row; nothing is written yet.
+    # Statement-level all-or-nothing. Day 4's WAL extends this guarantee
+    # from "no partial statement" to "no partial statement after a crash".
     matched = [
         (rid, row)
         for rid, row in table.store.scan()
@@ -396,6 +421,8 @@ def _execute_update(db: "Database", stmt: ast.Update) -> ExecuteResult:
         new_row = list(row)
         for pos, expr in positions.items():
             new_row[pos] = table._coerce(table.columns[pos], eval_expr(expr, row, table))
+        encode_row(table.columns, new_row)  # oversize/overflow fails HERE,
+        # before any row is written -- same all-or-nothing rule as INSERT
         if pk_pos is not None:
             old_value, new_value = row[pk_pos], new_row[pk_pos]
             if old_value != new_value:

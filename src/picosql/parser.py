@@ -81,14 +81,22 @@ class Parser:
     # ----------------------------------------------------------------- driver
 
     def parse_statements(self) -> list:
-        """Parse a semicolon-separated script. Returns a list of statements."""
+        """Parse a semicolon-separated script. Returns a list of statements.
+
+        Empty statements are tolerated, as in real SQL: leading, trailing
+        and repeated semicolons (;;...;) parse to nothing.
+        """
         statements = []
-        while self.peek().type != "EOF":
+        while True:
+            while self.eat_punct_opt(";"):
+                pass
+            if self.peek().type == "EOF":
+                break
             statements.append(self.parse_statement())
-            if self.eat_punct_opt(";"):
-                continue
             tok = self.peek()
-            if tok.type != "EOF":
+            if tok.type == "EOF":
+                break
+            if not self.eat_punct_opt(";"):
                 raise SqlError(
                     f"expected ';' after statement, got {tok.value!r}", tok.line, tok.col
                 )

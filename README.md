@@ -61,7 +61,7 @@ pico-sql> .quit
 跑测试：
 
 ```bash
-pytest -q   # 81 tests: pages / record / buffer pool / heap / persistence / parser / engine
+pytest -q   # 88 tests: pages / record / buffer pool / heap / persistence / parser / engine / atomicity
 ```
 
 ## 架构（目标形态）
@@ -79,7 +79,7 @@ flowchart TB
     WAL --> Disk
 ```
 
-灰色标注 ⏳ 的模块尚未实现——本仓库的 commit 历史就是实现顺序本身。
+图中带 Day 标注的模块按路线表逐日落地，未完成项见上方状态表的 ⏳——本仓库的 commit 历史就是实现顺序本身。
 
 ## SQL 子集
 
@@ -98,10 +98,14 @@ DELETE FROM users WHERE id = 3;
 
 ## Known Limitations（诚实清单）
 
-- **崩溃语义（pre-WAL）**：脏页在 `close()` 或逐出时落盘；进程在之前崩溃会丢数据——这正是 Day 4 WAL 要解决的问题
+- **崩溃语义（pre-WAL）**：脏页在 `close()` 或逐出时落盘；进程在之前崩溃会丢数据——这正是 Day 4 WAL 要解决的问题。（语句级原子性已保证：INSERT/UPDATE 先全量校验后统一写入，失败语句零残留）
+- **PRIMARY KEY 允许 NULL**（与标准 SQL 的"主键隐含 NOT NULL"不同），且多个 NULL 主键互不冲突（各自不入索引）；有测试固化此偏差
+- **无文件锁**：两个进程同时打开同一数据库文件会互相覆盖（真实引擎有实例锁/锁页）
 - 页 0 的目录（catalog）用 JSON 存储（真实数据库用专用二进制页 + 事务性更新）；单页 4KB 限制 schema 总量
 - 主键索引用 dict 实现（Day 3 换 B+ 树）；索引不持久化，启动时重建
 - 已删除的记录在页内留下墓碑，字节在页被复用前仍留在文件里（与真实数据库相同的隐私权衡）
+- 字符串比较/排序是 Unicode 码点序（真实数据库有 collation 排序规则）
+- 数字字面量不支持科学计数法（`1e5`）；整数值域为 INT64（越界报错而非截断）
 - 不支持多表 JOIN、聚合函数（COUNT/SUM...）、事务隔离级别
 - 不支持并发客户端连接
 - 整数除法向零截断（SQL 风格），负数取模沿用 Python 语义——两处都有文档说明

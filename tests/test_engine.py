@@ -140,3 +140,70 @@ def test_bool_column_roundtrip():
     )
     (res,) = db.execute_sql("SELECT ok FROM flags WHERE id = 1")
     assert res.rows == [[True]]
+
+
+# ------------------------------------------------- strict-review regressions
+
+
+def test_int64_overflow_rejected_as_engine_error():
+    db = make_db()
+    with pytest.raises(EngineError, match="INT64 range"):
+        db.execute_sql(f"INSERT INTO users VALUES ({2**63}, 'big', 1.0)")
+    with pytest.raises(EngineError, match="INT64 range"):
+        db.execute_sql(f"INSERT INTO users VALUES ({-(2**63) - 1}, 'big', 1.0)")
+    # produced by arithmetic, not just literals -- coercion is the gate
+    with pytest.raises(EngineError, match="INT64 range"):
+        db.execute_sql(f"INSERT INTO users VALUES ({2**63 - 1} + 1, 'big', 1.0)")
+    # boundary values are legal and persist
+    db.execute_sql(f"INSERT INTO users VALUES ({2**63 - 1}, 'max', 1.0)")
+    db.execute_sql(f"INSERT INTO users VALUES ({-(2**63)}, 'min', 1.0)")
+    (res,) = db.execute_sql("SELECT id FROM users WHERE name = 'max'")
+    assert res.rows == [[2**63 - 1]]
+
+
+def test_multi_row_insert_is_atomic():
+    db = make_db()
+    with pytest.raises(EngineError, match="duplicate primary key"):
+        db.execute_sql("INSERT INTO users VALUES (10, 'x', 1.0), (10, 'y', 2.0)")
+    # phase 1 must have written NOTHING: row (10,'x') must not exist
+    (res,) = db.execute_sql("SELECT * FROM users WHERE id = 10")
+    assert res.rows == []
+    (res,) = db.execute_sql("SELECT id FROM users")
+    assert len(res.rows) == 3  # the original three rows, untouched
+
+
+def test_insert_failure_mid_statement_writes_nothing():
+    db = make_db()
+    with pytest.raises(EngineError, match="expects INT"):
+        db.execute_sql("INSERT INTO users VALUES (10, 'ok', 1.0), ('bad', 'no', 2.0)")
+    (res,) = db.execute_sql("SELECT id FROM users WHERE id = 10")
+    assert res.rows == []  # the valid first row was staged, never committed
+
+
+def test_update_oversize_varchar_is_atomic():
+    db = Database()
+    db.execute_sql(
+        """
+        CREATE TABLE t (id INT PRIMARY KEY, note VARCHAR);
+        INSERT INTO t VALUES (1, 'short'), (2, 'also short');
+        """
+    )
+    with pytest.raises(EngineError, match="never fit"):
+        db.execute_sql(f"UPDATE t SET note = '{'x' * 5000}' WHERE id >= 1")
+    (res,) = db.execute_sql("SELECT note FROM t ORDER BY id")
+    assert res.rows == [["short"], ["also short"]]  # no partial commit
+
+
+def test_primary_key_allows_null_documented_deviation():
+    # KNOWN DEVIATION from standard SQL: PRIMARY KEY does not imply NOT NULL
+    # here, and multiple NULL keys are allowed (each is simply unindexed).
+    # Real engines reject the first INSERT outright.
+    db = Database()
+    db.execute_sql(
+        """
+        CREATE TABLE t (id INT PRIMARY KEY, v INT);
+        INSERT INTO t VALUES (NULL, 1), (NULL, 2);
+        """
+    )
+    (res,) = db.execute_sql("SELECT v FROM t WHERE v > 0")
+    assert res.rows == [[1], [2]]

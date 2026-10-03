@@ -95,3 +95,16 @@ def test_delete_and_update_where_optional():
     assert d.where is None
     (u,) = parse("UPDATE t SET a = 1")
     assert u.where is None
+
+
+def test_empty_statements_tolerated():
+    # leading, repeated and trailing semicolons parse to nothing
+    stmts = parse(";;CREATE TABLE t (id INT);;INSERT INTO t VALUES (1);;;;")
+    assert [type(s) for s in stmts] == [ast.CreateTable, ast.Insert]
+    assert parse(";") == []
+    assert parse("") == []
+
+
+def test_statement_without_trailing_semicolon_still_parses():
+    (stmt,) = parse("SELECT a FROM t")
+    assert isinstance(stmt, ast.Select)
