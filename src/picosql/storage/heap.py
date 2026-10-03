@@ -23,6 +23,7 @@ from .pages import (
     iterate_live,
     new_page,
     num_slots,
+    read_record,
     update_record_inplace,
 )
 from .record import decode_row, encode_row
@@ -61,6 +62,21 @@ class HeapTable:
             page = self.pool.get(page_id)
             for slot_no, record in iterate_live(page):
                 yield (page_id, slot_no), decode_row(self.columns, record)
+
+    def fetch(self, row_id: tuple) -> list:
+        """Decode one row by row_id = (page_id, slot_no).
+
+        This is the landing point of index lookups: O(1) page fetch instead
+        of an O(n) scan. Raises PageError if the slot is a tombstone (a stale
+        row_id) -- under normal operation stale ids cannot happen because
+        slot numbers are stable and update() returns the new id.
+        """
+        page_id, slot_no = row_id
+        page = self.pool.get(page_id)
+        record = read_record(page, slot_no)
+        if record is None:
+            raise PageError(f"row_id {row_id} points to a deleted slot")
+        return decode_row(self.columns, record)
 
     # ----------------------------------------------------------------- writes
 

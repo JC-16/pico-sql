@@ -19,8 +19,19 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import ast
+from .executor import (
+    FilterOperator,
+    IndexPointScanOperator,
+    IndexRangeScanOperator,
+    LimitOperator,
+    Operator,
+    ProjectOperator,
+    SeqScanOperator,
+    SortOperator,
+)
 from .lexer import SqlError  # noqa: F401  (re-exported for convenience)
 from .parser import parse
+from .storage.btree import BPlusTree, BTreeError
 from .storage.bufferpool import BufferPool, FilePageFile, MemoryPageFile
 from .storage.catalog import load_catalog, save_catalog
 from .storage.heap import HeapTable
@@ -81,7 +92,7 @@ class Column:
 
 
 class Table:
-    """Schema + heap store + primary-key index (dict until Day 3's B+ tree)."""
+    """Schema + heap store + primary-key B+ tree (row_id values)."""
 
     def __init__(self, name: str, columns: list, store: HeapTable):
         self.name = name
@@ -89,16 +100,19 @@ class Table:
         self.store = store
         pks = [c for c in columns if c.is_primary]
         self.pk: Optional[Column] = pks[0] if pks else None
-        self.pk_index: dict = {}  # pk value -> row_id
+        # B+ tree: key = primary-key value, value = row_id. NULL keys are
+        # never inserted (documented deviation: NULL primary keys are
+        # unindexed, so duplicates of NULL cannot be detected).
+        self.pk_index = BPlusTree()
 
     def rebuild_pk_index(self) -> None:
-        self.pk_index = {}
+        self.pk_index = BPlusTree()
         if self.pk is None:
             return
         pos = self.col_pos(self.pk.name)
         for rid, row in self.store.scan():
             if row[pos] is not None:
-                self.pk_index[row[pos]] = rid
+                self.pk_index.insert(row[pos], rid)
 
     def column_names(self) -> list:
         return [c.name for c in self.columns]
@@ -152,7 +166,7 @@ class Table:
         if self.pk is not None:
             value = row[self.col_pos(self.pk.name)]
             if value is not None:
-                self.pk_index[value] = rid
+                self.pk_index.insert(value, rid)
         return rid
 
     def delete_row(self, rid: tuple, row: Optional[list] = None) -> None:
@@ -166,7 +180,7 @@ class Table:
                         value = scan_row[pos]
                         break
             if value is not None:
-                self.pk_index.pop(value, None)
+                self.pk_index.delete(value)
         self.store.delete(rid)
 
     def update_row(self, rid: tuple, old_row: list, new_row: list) -> tuple:
@@ -176,9 +190,9 @@ class Table:
             old_value, new_value = old_row[pos], new_row[pos]
             if old_value != new_value:
                 if old_value is not None:
-                    self.pk_index.pop(old_value, None)
+                    self.pk_index.delete(old_value)
                 if new_value is not None:
-                    self.pk_index[new_value] = actual
+                    self.pk_index.insert(new_value, actual)
         return actual
 
 
@@ -377,25 +391,122 @@ def _execute_insert(db: "Database", stmt: ast.Insert) -> ExecuteResult:
 
 def _execute_select(db: "Database", stmt: ast.Select) -> QueryResult:
     table = db._require_table(stmt.table)
-    rows = [
-        row
-        for _, row in table.store.scan()
-        if stmt.where is None or _where_pass(eval_expr(stmt.where, row, table))
-    ]
+
+    # --- plan: can the WHERE clause resolve (partially) through the PK index?
+    factors = _split_conjunction(stmt.where)
+    plan, residual_factors = _extract_pk_plan(table, factors)
+    db.last_scan_used_index = plan is not None
+    if plan is not None:
+        scan: Operator = plan(table)
+        residual = _combine_conjunction(residual_factors)
+    else:
+        scan = SeqScanOperator(table)
+        residual = stmt.where
+
+    # --- pipeline: scan -> filter(residual) -> sort -> project -> limit
+    op: Operator = scan
+    if residual is not None:
+        op = FilterOperator(op, lambda row: _where_pass(eval_expr(residual, row, table)))
     if stmt.order_by is not None:
         col, desc = stmt.order_by
         pos = table.col_pos(col)
-        rows = sorted(rows, key=lambda r: _order_key(r[pos]), reverse=desc)
+        op = SortOperator(op, lambda row: _order_key(row[pos]), reverse=desc)
     if stmt.columns == ["*"]:
         out_cols = table.column_names()
-        out_rows = [list(r) for r in rows]
     else:
-        out_cols = list(stmt.columns)
         positions = [table.col_pos(c) for c in stmt.columns]
-        out_rows = [[r[i] for i in positions] for r in rows]
+        out_cols = list(stmt.columns)
+        op = ProjectOperator(op, positions)
     if stmt.limit is not None:
-        out_rows = out_rows[: stmt.limit]
-    return QueryResult(out_cols, out_rows)
+        op = LimitOperator(op, stmt.limit)
+
+    return QueryResult(out_cols, op.drain())
+
+
+def _split_conjunction(expr) -> list:
+    """Flatten an AND-chain into a list of factors (WHERE -> [f1, f2, ...])."""
+    if expr is None:
+        return []
+    if isinstance(expr, ast.BinaryOp) and expr.op == "AND":
+        return _split_conjunction(expr.left) + _split_conjunction(expr.right)
+    return [expr]
+
+
+def _combine_conjunction(factors: list):
+    if not factors:
+        return None
+    expr = factors[0]
+    for factor in factors[1:]:
+        expr = ast.BinaryOp("AND", expr, factor)
+    return expr
+
+
+_MIRROR_OP = {"=": "=", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
+
+
+def _extract_pk_plan(table: "Table", factors: list):
+    """Look for primary-key predicates a B+ tree can resolve.
+
+    Returns (plan_fn | None, residual_factors). plan_fn(table) builds the
+    index scan operator. Only conjunctive factors of the form
+    ``pk OP literal`` (or the mirrored ``literal OP pk``) qualify; OR-trees,
+    column-vs-column comparisons and non-PK columns all stay in the residual
+    and are applied by FilterOperator afterwards. v1 deliberately has no
+    optimizer beyond this rule -- see design.md section 3.13.
+    """
+    if table.pk is None:
+        return None, factors
+    pk_name = table.pk.name
+    eq = None
+    lo = hi = None
+    lo_inc = hi_inc = True
+    residual: list = []
+
+    for factor in factors:
+        used = False
+        if isinstance(factor, ast.BinaryOp) and factor.op in _MIRROR_OP:
+            left, right = factor.left, factor.right
+            if (
+                isinstance(right, ast.Literal)
+                and isinstance(left, ast.ColumnRef)
+                and left.name == pk_name
+            ):
+                op, value = factor.op, right.value
+            elif (
+                isinstance(left, ast.Literal)
+                and isinstance(right, ast.ColumnRef)
+                and right.name == pk_name
+            ):
+                op, value = _MIRROR_OP[factor.op], left.value
+            else:
+                residual.append(factor)
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                residual.append(factor)  # NULL literal etc. -- useless as a bound
+                continue
+            if op == "=":
+                eq = value
+            elif op in (">", ">="):
+                lo, lo_inc = value, op == ">="
+            else:
+                hi, hi_inc = value, op == "<="
+            used = True
+        if not used:
+            residual.append(factor)
+
+    # string bounds cannot be compared against numeric keys inside the tree
+    bounds = [v for v in (eq, lo, hi) if v is not None]
+    if bounds and any(isinstance(v, str) != isinstance(bounds[0], str) for v in bounds):
+        return None, factors
+
+    if eq is not None:
+        return lambda t: IndexPointScanOperator(t, eq), residual
+    if lo is not None or hi is not None:
+        return (
+            lambda t: IndexRangeScanOperator(t, lo, lo_inc, hi, hi_inc),
+            residual,
+        )
+    return None, factors
 
 
 def _execute_update(db: "Database", stmt: ast.Update) -> ExecuteResult:
@@ -417,6 +528,7 @@ def _execute_update(db: "Database", stmt: ast.Update) -> ExecuteResult:
         if stmt.where is None or _where_pass(eval_expr(stmt.where, row, table))
     ]
     updates = []
+    seen_new_pks: set = set()
     for rid, row in matched:
         new_row = list(row)
         for pos, expr in positions.items():
@@ -425,15 +537,17 @@ def _execute_update(db: "Database", stmt: ast.Update) -> ExecuteResult:
         # before any row is written -- same all-or-nothing rule as INSERT
         if pk_pos is not None:
             old_value, new_value = row[pk_pos], new_row[pk_pos]
-            if old_value != new_value:
-                if (
-                    new_value is not None
-                    and new_value in table.pk_index
-                    and table.pk_index[new_value] != rid
-                ):
+            if old_value != new_value and new_value is not None:
+                existing = table.pk_index.search(new_value)
+                if existing is not None and existing != rid:
                     raise EngineError(
                         f"duplicate primary key {new_value!r} in table {table.name!r}"
                     )
+                if new_value in seen_new_pks:
+                    raise EngineError(
+                        f"duplicate primary key {new_value!r} in table {table.name!r}"
+                    )
+                seen_new_pks.add(new_value)
         updates.append((rid, row, new_row))
 
     for rid, old_row, new_row in updates:
@@ -481,6 +595,7 @@ class Database:
         self.catalog = load_catalog(self.pool)
         self.free_pages: list = list(self.catalog.get("free_pages", []))
         self.tables: dict = {}
+        self.last_scan_used_index = None  # set by every SELECT (planner output)
         for name, entry in self.catalog["tables"].items():
             columns = [Column.from_dict(c) for c in entry["columns"]]
             store = HeapTable(self.pool, entry["page_ids"], columns, alloc_hook=self._alloc_page)
@@ -525,6 +640,8 @@ class Database:
         try:
             return _DISPATCH[type(stmt)](self, stmt)
         except PageError as exc:
+            raise EngineError(str(exc)) from None
+        except BTreeError as exc:
             raise EngineError(str(exc)) from None
         except RecursionError:
             raise EngineError("expression too deeply nested") from None

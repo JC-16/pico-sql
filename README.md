@@ -18,11 +18,11 @@ pico-sql 是一个教学向的关系型数据库引擎：不接受任何数据�
 |---|---|---|
 | 词法分析器（lexer） | ✅ Day 1 | 关键字/标识符/数字/字符串/操作符，带行列号报错 |
 | 递归下降语法解析器（parser） | ✅ Day 1 | SQL 子集 → AST，优先级分层 |
-| 内存执行引擎 | ✅ Day 1→2 | CREATE/DROP/INSERT/SELECT/UPDATE/DELETE，主键唯一约束 |
+| 内存执行引擎 | ✅ Day 1→2 | CREATE/DROP/INSERT/SELECT/UPDATE/DELETE，语句级原子性 |
 | Slotted Page 页式存储引擎 | ✅ Day 2 | 4KB 页、槽目录两端生长、墓碑标记、页内压缩 |
 | LRU 缓冲池 | ✅ Day 2 | 脏页追踪、逐出回写、命中率统计、内存/磁盘双后端 |
-| B+ 树索引 | ⏳ Day 3 | 替换 dict 主键索引，支持范围扫描 |
-| 火山模型执行器 | ⏳ Day 3 | Open/Next/Close 迭代器架构 |
+| B+ 树索引 | ✅ Day 3 | 分裂/合并/借用全套、叶子链范围扫描、4000 次随机对拍 |
+| 火山模型执行器 | ✅ Day 3 | Open/Next/Close 管线 + WHERE 主键索引下推（点查/范围） |
 | WAL 预写日志 + 崩溃恢复 | ⏳ Day 4 | 真实 kill -9 崩溃演示 |
 | 性能基准 | ⏳ Day 4 | 索引扫描 vs 全表扫描对比图 |
 
@@ -58,10 +58,23 @@ pico-sql> .quit
 
 不带文件参数则运行在内存模式（`Database()` 使用 MemoryPageFile，与磁盘模式走同一条代码路径）。
 
+## 索引加速（Day 3 起）
+
+WHERE 里对**主键**的等值/范围条件会自动走 B+ 树（`last_scan_used_index` 可验证）：
+
+```python
+db.execute_sql("SELECT * FROM t WHERE id = 250")    # O(log n) 点查 + 单页取行
+db.execute_sql("SELECT * FROM t WHERE id > 290")    # 叶子链范围扫描
+db.execute_sql("SELECT * FROM t WHERE grp = 7")     # 非主键列：全表扫描（v1 只有主键索引）
+```
+
+规划规则（详见 design.md §3.13）：只下推 AND 因子中的 `主键 OP 字面量`；
+OR、列间比较、非主键列全部留在 FilterOperator 的残差里逐行过滤。
+
 跑测试：
 
 ```bash
-pytest -q   # 88 tests: pages / record / buffer pool / heap / persistence / parser / engine / atomicity
+pytest -q   # 114 tests：含 B+ 树 4000 次随机操作对拍、火山管线惰性求值证明
 ```
 
 ## 架构（目标形态）
