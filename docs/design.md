@@ -227,4 +227,14 @@ Limit -> Project -> Sort -> Filter -> Index/SeqScan
   火山流水线与主键索引下推（点查/范围/残差过滤），`last_scan_used_index`
   暴露规划结果；HeapTable 新增 fetch(row_id)。新增妥协：仅主键单列索引、
   OR/列间比较不走索引、Sort 阻塞无外排、DML 未算子化。
+- **第二轮加固（2026-10-03，对抗审查第二遍，覆盖第一轮未触及的区域）**：
+  修复 6 项——①REPL 按 `;` 切分语句时不感知字符串字面量，含分号的多行
+  字符串会被切碎且用户可能被卡死（修复：引号奇偶校验 + `.quit` 永远可用，
+  字符串内的 `.quit` 行视为内容）；②目录页 JSON 损坏时裸 json.JSONDecodeError
+  逃逸出引擎边界（修复：收敛为 PageError，打开数据库时转为 EngineError）；
+  ③FilePageFile 打开失败（权限/路径/被锁）泄漏裸 OSError（修复：包为
+  PageError）；④Database.close() 二次调用会因关闭的文件句柄抛裸 ValueError
+  （修复：close 幂等）；⑤close 后再 execute 泄漏裸 ValueError（修复：池与
+  引擎增加 closed 状态，拒绝操作）；⑥词法器"数字开头的标识符"行为写入文档
+  并用测试固化。新增 10 个回归测试（124 total）。
 - Day 4（计划）：WAL + 崩溃恢复 + 性能基准。

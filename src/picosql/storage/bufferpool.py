@@ -65,21 +65,35 @@ class FilePageFile:
 
     def __init__(self, path):
         self.path = Path(path)
-        if not self.path.exists():
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_bytes(b"")
-        self._file = open(self.path, "r+b")
-        self._file.seek(0, os.SEEK_END)
-        size = self._file.tell()
+        self._closed = False
+        try:
+            if not self.path.exists():
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_bytes(b"")
+            self._file = open(self.path, "r+b")
+            self._file.seek(0, os.SEEK_END)
+            size = self._file.tell()
+        except OSError as exc:
+            # open() failures (permissions, locked file, bad path) must not
+            # leak raw OSError through the storage boundary
+            raise PageError(f"cannot open database file {self.path}: {exc}") from None
         if size % PAGE_SIZE != 0:
-            raise PageError(f"{self.path} is truncated ({size} bytes, not a page multiple)")
+            self._file.close()
+            raise PageError(
+                f"{self.path} is truncated ({size} bytes, not a page multiple)"
+            )
         self._num_pages = size // PAGE_SIZE
 
     @property
     def num_pages(self) -> int:
         return self._num_pages
 
+    def _check_open(self) -> None:
+        if self._closed:
+            raise PageError("page file is closed")
+
     def read_page(self, page_id: int) -> bytes:
+        self._check_open()
         if not 0 <= page_id < self._num_pages:
             raise PageError(f"page {page_id} out of range (have {self._num_pages})")
         self._file.seek(page_id * PAGE_SIZE)
@@ -89,6 +103,7 @@ class FilePageFile:
         return data
 
     def write_page(self, page_id: int, data: bytes) -> None:
+        self._check_open()
         if len(data) != PAGE_SIZE:
             raise PageError(f"write size is {len(data)}, expected {PAGE_SIZE}")
         if not 0 <= page_id < self._num_pages:
@@ -97,6 +112,7 @@ class FilePageFile:
         self._file.write(data)
 
     def alloc_page(self) -> int:
+        self._check_open()
         page_id = self._num_pages
         self._file.seek(page_id * PAGE_SIZE)
         self._file.write(bytes(PAGE_SIZE))
@@ -104,12 +120,17 @@ class FilePageFile:
         return page_id
 
     def sync(self) -> None:
+        if self._closed:
+            return
         self._file.flush()
         os.fsync(self._file.fileno())
 
     def close(self) -> None:
+        if self._closed:
+            return  # idempotent: double close must not crash
         self.sync()
         self._file.close()
+        self._closed = True
 
 
 # ----------------------------------------------------------------- buffer pool
@@ -134,8 +155,14 @@ class BufferPool:
         self._dirty: set = set()
         self.hits = 0
         self.misses = 0
+        self._closed = False
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise PageError("buffer pool is closed")
 
     def get(self, page_id: int) -> bytearray:
+        self._check_open()
         page = self._pages.get(page_id)
         if page is not None:
             self.hits += 1
@@ -154,6 +181,7 @@ class BufferPool:
             self._dirty.discard(page_id)
 
     def mark_dirty(self, page_id: int) -> None:
+        self._check_open()
         if page_id not in self._pages:
             raise PageError(f"cannot mark non-resident page {page_id} dirty")
         self._dirty.add(page_id)
@@ -182,6 +210,9 @@ class BufferPool:
         return self.hits / total if total else 0.0
 
     def close(self) -> None:
+        if self._closed:
+            return  # idempotent
+        self._closed = True
         self.flush_all()
         self.page_file.sync()
 

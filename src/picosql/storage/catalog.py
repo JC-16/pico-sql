@@ -27,8 +27,13 @@ def load_catalog(pool: BufferPool) -> dict:
     text = bytes(page).rstrip(b"\x00").decode("utf-8")
     if not text:
         return json.loads(json.dumps(_EMPTY))
-    catalog = json.loads(text)
-    if catalog.get("version") != CATALOG_VERSION:
+    try:
+        catalog = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # corrupt catalog must surface as a storage-layer error, not as a
+        # raw json exception leaking through the engine boundary
+        raise PageError(f"catalog page is corrupt: {exc}") from None
+    if not isinstance(catalog, dict) or catalog.get("version") != CATALOG_VERSION:
         raise PageError(f"unknown catalog version {catalog.get('version')!r}")
     return catalog
 

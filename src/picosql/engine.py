@@ -592,7 +592,13 @@ class Database:
             MemoryPageFile() if path is None else FilePageFile(Path(path))
         )
         self.pool = BufferPool(self.page_file, buffer_capacity)
-        self.catalog = load_catalog(self.pool)
+        self._closed = False
+        try:
+            self.catalog = load_catalog(self.pool)
+        except PageError as exc:
+            self.pool.close()
+            self.page_file.close()
+            raise EngineError(f"cannot open database: {exc}") from None
         self.free_pages: list = list(self.catalog.get("free_pages", []))
         self.tables: dict = {}
         self.last_scan_used_index = None  # set by every SELECT (planner output)
@@ -637,6 +643,8 @@ class Database:
         return table
 
     def execute(self, stmt):
+        if self._closed:
+            raise EngineError("database is closed")
         try:
             return _DISPATCH[type(stmt)](self, stmt)
         except PageError as exc:
@@ -651,9 +659,13 @@ class Database:
         return [self.execute(stmt) for stmt in parse(text)]
 
     def close(self) -> None:
-        """Flush dirty pages and persist the catalog."""
+        """Flush dirty pages and persist the catalog. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
         self._save_catalog()
-        self.pool.close()
+        self.pool.close()  # flush all dirty pages + fsync
+        self.page_file.close()
 
 
 __all__ = [

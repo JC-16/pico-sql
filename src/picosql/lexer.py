@@ -7,6 +7,8 @@ The lexer is stage one of the pipeline:
 Design notes (see STUDY.md for a guided tour):
 * Keywords are matched case-insensitively and normalized to UPPERCASE.
 * Identifiers keep their original case.
+* Identifiers cannot start with a digit: "1abc" lexes as NUMBER(1) followed
+  by IDENT(abc) -- the parser then reports a position error at the identifier.
 * ``''`` inside a string literal escapes a single quote (SQL standard).
 * ``--`` starts a line comment.
 * Every token carries (line, col) so error messages can point at the spot.
