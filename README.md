@@ -18,9 +18,9 @@ pico-sql 是一个教学向的关系型数据库引擎：不接受任何数据�
 |---|---|---|
 | 词法分析器（lexer） | ✅ Day 1 | 关键字/标识符/数字/字符串/操作符，带行列号报错 |
 | 递归下降语法解析器（parser） | ✅ Day 1 | SQL 子集 → AST，优先级分层 |
-| 内存执行引擎 | ✅ Day 1 | CREATE/DROP/INSERT/SELECT/UPDATE/DELETE，主键唯一约束 |
-| Slotted Page 页式存储引擎 | ⏳ Day 2 | 4KB 页、变长记录、页目录 |
-| LRU 缓冲池 | ⏳ Day 2 | 脏页追踪 + 逐出回写 |
+| 内存执行引擎 | ✅ Day 1→2 | CREATE/DROP/INSERT/SELECT/UPDATE/DELETE，主键唯一约束 |
+| Slotted Page 页式存储引擎 | ✅ Day 2 | 4KB 页、槽目录两端生长、墓碑标记、页内压缩 |
+| LRU 缓冲池 | ✅ Day 2 | 脏页追踪、逐出回写、命中率统计、内存/磁盘双后端 |
 | B+ 树索引 | ⏳ Day 3 | 替换 dict 主键索引，支持范围扫描 |
 | 火山模型执行器 | ⏳ Day 3 | Open/Next/Close 迭代器架构 |
 | WAL 预写日志 + 崩溃恢复 | ⏳ Day 4 | 真实 kill -9 崩溃演示 |
@@ -35,9 +35,11 @@ pip install -e .[dev]
 python -m picosql
 ```
 
-一个真实的会话（Day 1 版本，数据尚在内存中）：
+一个真实的会话（带持久化）：
 
 ```
+> python -m picosql demo.pico
+pico-sql v0.1.0 -- a tiny SQL engine for learning (.help for help) [db: demo.pico]
 pico-sql> CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(20), score FLOAT);
 table 'users' created
 pico-sql> INSERT INTO users VALUES (1, 'alice', 91.5), (2, 'bob', 72.0);
@@ -50,12 +52,16 @@ pico-sql> SELECT name, score FROM users WHERE score >= 60 ORDER BY score DESC;
 | bob     | 72.0  |
 +---------+-------+
 2 row(s)
+pico-sql> .quit
+> python -m picosql demo.pico   # 重新打开，数据还在
 ```
+
+不带文件参数则运行在内存模式（`Database()` 使用 MemoryPageFile，与磁盘模式走同一条代码路径）。
 
 跑测试：
 
 ```bash
-pytest -q
+pytest -q   # 81 tests: pages / record / buffer pool / heap / persistence / parser / engine
 ```
 
 ## 架构（目标形态）
@@ -92,8 +98,10 @@ DELETE FROM users WHERE id = 3;
 
 ## Known Limitations（诚实清单）
 
-- 数据目前存于内存，进程退出即消失（Day 2 落盘，Day 4 抗崩溃）
+- **崩溃语义（pre-WAL）**：脏页在 `close()` 或逐出时落盘；进程在之前崩溃会丢数据——这正是 Day 4 WAL 要解决的问题
+- 页 0 的目录（catalog）用 JSON 存储（真实数据库用专用二进制页 + 事务性更新）；单页 4KB 限制 schema 总量
 - 主键索引用 dict 实现（Day 3 换 B+ 树）；索引不持久化，启动时重建
+- 已删除的记录在页内留下墓碑，字节在页被复用前仍留在文件里（与真实数据库相同的隐私权衡）
 - 不支持多表 JOIN、聚合函数（COUNT/SUM...）、事务隔离级别
 - 不支持并发客户端连接
 - 整数除法向零截断（SQL 风格），负数取模沿用 Python 语义——两处都有文档说明

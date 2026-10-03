@@ -71,8 +71,8 @@ def test_incomplete_statement_keeps_buffer_then_eof():
 def test_database_state_survives_via_returned_object():
     db = Database()
     drive(["CREATE TABLE k (id INT PRIMARY KEY);", "INSERT INTO k VALUES (1);", ".quit"], db=db)
-    assert "k" in db.tables
-    assert db.tables["k"].rows == [[1]]
+    (res,) = db.execute_sql("SELECT id FROM k")
+    assert res.rows == [[1]]
 
 
 def test_engine_error_type_stable():

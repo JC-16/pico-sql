@@ -1,30 +1,34 @@
-"""D1 in-memory execution engine (temporary implementation).
+"""SQL engine on top of the persistent storage layer (Day 2).
 
-Day-1 goal: get SQL running end to end (parse -> execute -> result). Data
-lives in plain Python lists and dies with the process -- deliberately so.
-Day 2 replaces this with a slotted-page storage engine + LRU buffer pool,
-and Day 4 adds WAL crash recovery. The commit history keeps this evolution
-visible on purpose: a database is built layer by layer, not all at once.
+``Database(path)`` opens or creates a file-backed database: page 0 holds the
+catalog (schemas + page lists as JSON), data pages follow. ``Database()``
+without a path runs against a MemoryPageFile -- same code path, no file.
 
-Semantics notes (all documented in README "Known Limitations" too):
-* v1 supports a single unquoted-identifier world: tables/columns are IDENTs.
-* NULL comparisons return NULL (SQL three-valued logic); WHERE treats
-  NULL as "not matched".
-* Integer / integer division truncates toward zero, SQL-style.
+Crash semantics, honestly: writes reach the disk when the buffer pool
+flushes (on close, or when a dirty page is evicted). A process crash before
+that can lose data. Day 4's WAL closes this gap with write-ahead logging.
+
+Rows are identified by row_id = (page_id, slot_no). The executor never sees
+pages or bytes -- it talks to Table, which talks to HeapTable.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 from . import ast
 from .lexer import SqlError  # noqa: F401  (re-exported for convenience)
 from .parser import parse
+from .storage.bufferpool import BufferPool, FilePageFile, MemoryPageFile
+from .storage.catalog import load_catalog, save_catalog
+from .storage.heap import HeapTable
+from .storage.pages import PageError, new_page
 
 
 class EngineError(Exception):
-    """A runtime error (unknown table, type violation, constraint violation...)."""
+    """A runtime error: unknown table, type violation, constraint violation."""
 
 
 # ------------------------------------------------------------------- results
@@ -32,7 +36,7 @@ class EngineError(Exception):
 
 @dataclass
 class QueryResult:
-    """Result of a SELECT: column names + row tuples."""
+    """Result of a SELECT: column names + row values."""
 
     columns: list
     rows: list
@@ -56,21 +60,41 @@ class Column:
         self.varchar_len = defn.varchar_len
         self.is_primary = defn.is_primary
 
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "type": self.type,
+            "varchar_len": self.varchar_len,
+            "primary": self.is_primary,
+        }
+
+    @classmethod
+    def from_dict(cls, obj: dict) -> "Column":
+        defn = ast.ColumnDef(
+            obj["name"], obj["type"], obj.get("varchar_len"), obj.get("primary", False)
+        )
+        return cls(defn)
+
 
 class Table:
-    """An in-memory table: schema + rows + a dict-based primary key index.
+    """Schema + heap store + primary-key index (dict until Day 3's B+ tree)."""
 
-    The pk_index maps primary-key value -> row object. Day 3 replaces this
-    dict with a real B+ tree that also supports range scans.
-    """
-
-    def __init__(self, stmt: ast.CreateTable):
-        self.name = stmt.table
-        self.columns = [Column(c) for c in stmt.columns]
-        self.rows: list[list] = []
-        pks = [c for c in self.columns if c.is_primary]
+    def __init__(self, name: str, columns: list, store: HeapTable):
+        self.name = name
+        self.columns = columns
+        self.store = store
+        pks = [c for c in columns if c.is_primary]
         self.pk: Optional[Column] = pks[0] if pks else None
-        self.pk_index: dict = {}
+        self.pk_index: dict = {}  # pk value -> row_id
+
+    def rebuild_pk_index(self) -> None:
+        self.pk_index = {}
+        if self.pk is None:
+            return
+        pos = self.col_pos(self.pk.name)
+        for rid, row in self.store.scan():
+            if row[pos] is not None:
+                self.pk_index[row[pos]] = rid
 
     def column_names(self) -> list:
         return [c.name for c in self.columns]
@@ -111,6 +135,40 @@ class Table:
                     f"column {col.name!r} expects BOOL, got {type(value).__name__}"
                 )
         return value
+
+    def insert_row(self, row: list) -> tuple:
+        rid = self.store.insert(row)
+        if self.pk is not None:
+            value = row[self.col_pos(self.pk.name)]
+            if value is not None:
+                self.pk_index[value] = rid
+        return rid
+
+    def delete_row(self, rid: tuple, row: Optional[list] = None) -> None:
+        if self.pk is not None:
+            value = row[self.col_pos(self.pk.name)] if row is not None else None
+            if value is None:
+                # caller didn't supply the row; recover the pk from the record
+                pos = self.col_pos(self.pk.name)
+                for scan_rid, scan_row in self.store.scan():
+                    if scan_rid == rid:
+                        value = scan_row[pos]
+                        break
+            if value is not None:
+                self.pk_index.pop(value, None)
+        self.store.delete(rid)
+
+    def update_row(self, rid: tuple, old_row: list, new_row: list) -> tuple:
+        actual = self.store.update(rid, new_row)
+        if self.pk is not None:
+            pos = self.col_pos(self.pk.name)
+            old_value, new_value = old_row[pos], new_row[pos]
+            if old_value != new_value:
+                if old_value is not None:
+                    self.pk_index.pop(old_value, None)
+                if new_value is not None:
+                    self.pk_index[new_value] = actual
+        return actual
 
 
 # -------------------------------------------------------------- expressions
@@ -235,21 +293,28 @@ def _order_key(value: Any) -> tuple:
     return (1, value)
 
 
-# ------------------------------------------------------------------ executor
+# ------------------------------------------------------------------- executor
 
 
 def _execute_create(db: "Database", stmt: ast.CreateTable) -> ExecuteResult:
     if stmt.table in db.tables:
         raise EngineError(f"table {stmt.table!r} already exists")
-    db.tables[stmt.table] = Table(stmt)
-    return ExecuteResult(f"table {stmt.table!r} created", affected=0)
+    columns = [Column(c) for c in stmt.columns]
+    store = HeapTable(db.pool, [], columns, alloc_hook=db._alloc_page)
+    db.tables[stmt.table] = Table(stmt.table, columns, store)
+    db._save_catalog()
+    return ExecuteResult(f"table {stmt.table!r} created")
 
 
 def _execute_drop(db: "Database", stmt: ast.DropTable) -> ExecuteResult:
     if stmt.table not in db.tables:
         raise EngineError(f"no such table: {stmt.table!r}")
-    del db.tables[stmt.table]
-    return ExecuteResult(f"table {stmt.table!r} dropped", affected=0)
+    table = db.tables.pop(stmt.table)
+    # recycle the table's pages for future tables; old bytes linger until
+    # each page is reused -- same visibility tradeoff real engines make
+    db.free_pages.extend(table.store.page_ids)
+    db._save_catalog()
+    return ExecuteResult(f"table {stmt.table!r} dropped")
 
 
 def _execute_insert(db: "Database", stmt: ast.Insert) -> ExecuteResult:
@@ -260,15 +325,13 @@ def _execute_insert(db: "Database", stmt: ast.Insert) -> ExecuteResult:
         if stmt.columns is None:
             if len(row_exprs) != ncols:
                 raise EngineError(
-                    f"table {table.name!r} has {ncols} columns, "
-                    f"got {len(row_exprs)} values"
+                    f"table {table.name!r} has {ncols} columns, got {len(row_exprs)} values"
                 )
             targets = table.columns
         else:
             if len(row_exprs) != len(stmt.columns):
                 raise EngineError(
-                    f"{len(stmt.columns)} columns specified, "
-                    f"got {len(row_exprs)} values"
+                    f"{len(stmt.columns)} columns specified, got {len(row_exprs)} values"
                 )
             targets = [table.columns[table.col_pos(c)] for c in stmt.columns]
         values: list = [None] * ncols
@@ -283,18 +346,18 @@ def _execute_insert(db: "Database", stmt: ast.Insert) -> ExecuteResult:
                 raise EngineError(
                     f"duplicate primary key {pk_value!r} in table {table.name!r}"
                 )
-        table.rows.append(values)
-        if table.pk is not None and values[pk_pos] is not None:
-            table.pk_index[values[pk_pos]] = values
+        table.insert_row(values)
         inserted += 1
     return ExecuteResult(f"{inserted} row(s) inserted", affected=inserted)
 
 
 def _execute_select(db: "Database", stmt: ast.Select) -> QueryResult:
     table = db._require_table(stmt.table)
-    rows = table.rows
-    if stmt.where is not None:
-        rows = [r for r in rows if _where_pass(eval_expr(stmt.where, r, table))]
+    rows = [
+        row
+        for _, row in table.store.scan()
+        if stmt.where is None or _where_pass(eval_expr(stmt.where, row, table))
+    ]
     if stmt.order_by is not None:
         col, desc = stmt.order_by
         pos = table.col_pos(col)
@@ -321,16 +384,15 @@ def _execute_update(db: "Database", stmt: ast.Update) -> ExecuteResult:
         positions[pos] = expr
     pk_pos = table.col_pos(table.pk.name) if table.pk is not None else None
 
-    # Validate every row first, then commit -- a tiny nod to atomicity that
-    # Day 4's WAL will make real.
+    # validate every row first, then commit -- a tiny nod to atomicity that
+    # Day 4's WAL will make real
     matched = [
-        i
-        for i, r in enumerate(table.rows)
-        if stmt.where is None or _where_pass(eval_expr(stmt.where, r, table))
+        (rid, row)
+        for rid, row in table.store.scan()
+        if stmt.where is None or _where_pass(eval_expr(stmt.where, row, table))
     ]
     updates = []
-    for i in matched:
-        row = table.rows[i]
+    for rid, row in matched:
         new_row = list(row)
         for pos, expr in positions.items():
             new_row[pos] = table._coerce(table.columns[pos], eval_expr(expr, row, table))
@@ -340,40 +402,28 @@ def _execute_update(db: "Database", stmt: ast.Update) -> ExecuteResult:
                 if (
                     new_value is not None
                     and new_value in table.pk_index
-                    and table.pk_index[new_value] is not row
+                    and table.pk_index[new_value] != rid
                 ):
                     raise EngineError(
                         f"duplicate primary key {new_value!r} in table {table.name!r}"
                     )
-        updates.append((i, row, new_row))
+        updates.append((rid, row, new_row))
 
-    for i, row, new_row in updates:
-        table.rows[i] = new_row
-        if pk_pos is not None:
-            old_value, new_value = row[pk_pos], new_row[pk_pos]
-            if old_value != new_value:
-                if old_value is not None:
-                    table.pk_index.pop(old_value, None)
-                if new_value is not None:
-                    table.pk_index[new_value] = new_row
+    for rid, old_row, new_row in updates:
+        table.update_row(rid, old_row, new_row)
     return ExecuteResult(f"{len(updates)} row(s) updated", affected=len(updates))
 
 
 def _execute_delete(db: "Database", stmt: ast.Delete) -> ExecuteResult:
     table = db._require_table(stmt.table)
-    pk_pos = table.col_pos(table.pk.name) if table.pk is not None else None
-    kept: list = []
-    deleted = 0
-    for row in table.rows:
-        matched = stmt.where is None or _where_pass(eval_expr(stmt.where, row, table))
-        if matched:
-            deleted += 1
-            if pk_pos is not None and row[pk_pos] is not None:
-                table.pk_index.pop(row[pk_pos], None)
-        else:
-            kept.append(row)
-    table.rows = kept
-    return ExecuteResult(f"{deleted} row(s) deleted", affected=deleted)
+    matched = [
+        (rid, row)
+        for rid, row in table.store.scan()
+        if stmt.where is None or _where_pass(eval_expr(stmt.where, row, table))
+    ]
+    for rid, row in matched:
+        table.delete_row(rid, row)
+    return ExecuteResult(f"{len(matched)} row(s) deleted", affected=len(matched))
 
 
 _DISPATCH = {
@@ -390,10 +440,53 @@ _DISPATCH = {
 
 
 class Database:
-    """A collection of in-memory tables. Day 2 adds a file-backed catalog."""
+    """A collection of tables backed by the storage layer.
 
-    def __init__(self):
+    ``Database()``          -> ephemeral, in-memory pages
+    ``Database("db.pico")`` -> file-backed; survives close() + reopen
+    """
+
+    def __init__(self, path=None, buffer_capacity: int = 64):
+        self.page_file = (
+            MemoryPageFile() if path is None else FilePageFile(Path(path))
+        )
+        self.pool = BufferPool(self.page_file, buffer_capacity)
+        self.catalog = load_catalog(self.pool)
+        self.free_pages: list = list(self.catalog.get("free_pages", []))
         self.tables: dict = {}
+        for name, entry in self.catalog["tables"].items():
+            columns = [Column.from_dict(c) for c in entry["columns"]]
+            store = HeapTable(self.pool, entry["page_ids"], columns, alloc_hook=self._alloc_page)
+            table = Table(name, columns, store)
+            table.rebuild_pk_index()
+            self.tables[name] = table
+
+    def _alloc_page(self) -> int:
+        """Allocate a page for table data: recycle dropped pages first.
+
+        Both fresh and recycled pages are (re-)initialized with a valid
+        header -- a recycled page still carries the dropped table's data
+        until every byte of it happens to be overwritten.
+        """
+        recycled = bool(self.free_pages)
+        page_id = self.free_pages.pop(0) if recycled else self.pool.page_file.alloc_page()
+        page = self.pool.get(page_id)
+        page[:] = bytes(new_page(page_id))
+        self.pool.mark_dirty(page_id)
+        if recycled:
+            self._save_catalog()
+        return page_id
+
+    def _save_catalog(self) -> None:
+        self.catalog["tables"] = {
+            name: {
+                "columns": [c.to_dict() for c in table.columns],
+                "page_ids": table.store.page_ids,
+            }
+            for name, table in self.tables.items()
+        }
+        self.catalog["free_pages"] = self.free_pages
+        save_catalog(self.pool, self.catalog)
 
     def _require_table(self, name: str) -> Table:
         table = self.tables.get(name)
@@ -404,9 +497,25 @@ class Database:
     def execute(self, stmt):
         try:
             return _DISPATCH[type(stmt)](self, stmt)
+        except PageError as exc:
+            raise EngineError(str(exc)) from None
         except RecursionError:
             raise EngineError("expression too deeply nested") from None
 
     def execute_sql(self, text: str) -> list:
         """Parse and run a whole script; returns one result per statement."""
         return [self.execute(stmt) for stmt in parse(text)]
+
+    def close(self) -> None:
+        """Flush dirty pages and persist the catalog."""
+        self._save_catalog()
+        self.pool.close()
+
+
+__all__ = [
+    "Database",
+    "EngineError",
+    "ExecuteResult",
+    "QueryResult",
+    "Table",
+]

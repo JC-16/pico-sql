@@ -56,10 +56,11 @@ def run_loop(
     read_line: Callable[[str], Optional[str]] = input,
     echo: Callable[[str], None] = print,
     database: Optional[Database] = None,
+    banner: str = BANNER,
 ) -> Database:
     """Run the REPL. Returns the database so tests can inspect the state."""
     db = database if database is not None else Database()
-    echo(BANNER)
+    echo(banner)
     buffer = ""
     while True:
         prompt = "pico-sql> " if not buffer else "       -> "
@@ -102,4 +103,33 @@ def run_loop(
 
 
 def main() -> None:
-    run_loop()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="pico-sql",
+        description="A tiny SQL engine for learning how databases work.",
+    )
+    parser.add_argument(
+        "file",
+        nargs="?",
+        default=None,
+        help="database file (omit to run against in-memory pages)",
+    )
+    parser.add_argument(
+        "--buffer-pages",
+        type=int,
+        default=64,
+        help="buffer pool capacity in pages (default: 64)",
+    )
+    args = parser.parse_args()
+
+    if args.file is not None:
+        db = Database(args.file, buffer_capacity=args.buffer_pages)
+        banner = f"{BANNER} [db: {args.file}]"
+    else:
+        db = Database(buffer_capacity=args.buffer_pages)
+        banner = f"{BANNER} [in-memory: pass a file path to persist]"
+    try:
+        run_loop(database=db, banner=banner)
+    finally:
+        db.close()
