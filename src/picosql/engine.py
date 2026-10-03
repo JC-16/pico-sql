@@ -441,30 +441,53 @@ def _combine_conjunction(factors: list):
     return expr
 
 
-_MIRROR_OP = {"=": "=", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
+_EXTRACTABLE_OPS = ("=", "<", "<=", ">", ">=")
+_MIRROR_OP = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}
 
+
+def _tighten(bound_list: list, lower: bool) -> tuple:
+    """Reduce (value, inclusive) pairs to the tightest single bound.
+
+    lower=True  -> the maximum value wins; on ties, exclusivity wins.
+    lower=False -> the minimum value wins; on ties, exclusivity wins.
+    Returns (value, inclusive) or (None, True) for an empty list.
+    """
+    if not bound_list:
+        return None, True
+    values = [v for v, _ in bound_list]
+    best = max(values) if lower else min(values)
+    inclusive = all(inc for v, inc in bound_list if v == best)
+    return best, inclusive
 
 def _extract_pk_plan(table: "Table", factors: list):
     """Look for primary-key predicates a B+ tree can resolve.
 
     Returns (plan_fn | None, residual_factors). plan_fn(table) builds the
     index scan operator. Only conjunctive factors of the form
-    ``pk OP literal`` (or the mirrored ``literal OP pk``) qualify; OR-trees,
-    column-vs-column comparisons and non-PK columns all stay in the residual
-    and are applied by FilterOperator afterwards. v1 deliberately has no
-    optimizer beyond this rule -- see design.md section 3.13.
+    ``pk OP literal`` (or the mirrored ``literal OP pk``) with OP in
+    =, <, <=, >, >= qualify. ``!=``/``<>`` deliberately do NOT: a disequality
+    is the union of two ranges, not a bound -- misreading it as an upper
+    bound would silently drop every row above the literal.
+
+    Multiple bounds are TIGHTENED, never overwritten: lo = max of lower
+    bounds (exclusivity wins on ties), hi = min of upper bounds. A tightened
+    range implies every individual range factor, so range factors are fully
+    consumed by the scan. When an equality coexists with other pk factors,
+    the point scan runs on the first equality and the remaining pk factors
+    are demoted into the residual filter -- contradictory conjunctions
+    (id = 2 AND id > 3, id = 5 AND id = 6) then correctly return nothing
+    instead of whatever the first bound happened to match.
     """
     if table.pk is None:
         return None, factors
     pk_name = table.pk.name
-    eq = None
-    lo = hi = None
-    lo_inc = hi_inc = True
+    eqs: list = []
+    lo_list: list = []
+    hi_list: list = []
     residual: list = []
 
     for factor in factors:
-        used = False
-        if isinstance(factor, ast.BinaryOp) and factor.op in _MIRROR_OP:
+        if isinstance(factor, ast.BinaryOp) and factor.op in _EXTRACTABLE_OPS:
             left, right = factor.left, factor.right
             if (
                 isinstance(right, ast.Literal)
@@ -477,7 +500,8 @@ def _extract_pk_plan(table: "Table", factors: list):
                 and isinstance(right, ast.ColumnRef)
                 and right.name == pk_name
             ):
-                op, value = _MIRROR_OP[factor.op], left.value
+                # "=" mirrors to itself; the dict only holds asymmetric ops
+                op, value = _MIRROR_OP.get(factor.op, factor.op), left.value
             else:
                 residual.append(factor)
                 continue
@@ -485,23 +509,37 @@ def _extract_pk_plan(table: "Table", factors: list):
                 residual.append(factor)  # NULL literal etc. -- useless as a bound
                 continue
             if op == "=":
-                eq = value
+                eqs.append((value, factor))
             elif op in (">", ">="):
-                lo, lo_inc = value, op == ">="
+                lo_list.append((value, op == ">=", factor))
             else:
-                hi, hi_inc = value, op == "<="
-            used = True
-        if not used:
+                hi_list.append((value, op == "<=", factor))
+        else:
             residual.append(factor)
 
     # string bounds cannot be compared against numeric keys inside the tree
-    bounds = [v for v in (eq, lo, hi) if v is not None]
-    if bounds and any(isinstance(v, str) != isinstance(bounds[0], str) for v in bounds):
+    all_values = [v for v, _ in eqs] + [v for v, _, _ in lo_list] + [
+        v for v, _, _ in hi_list
+    ]
+    if all_values and any(
+        isinstance(v, str) != isinstance(all_values[0], str) for v in all_values
+    ):
         return None, factors
 
-    if eq is not None:
-        return lambda t: IndexPointScanOperator(t, eq), residual
-    if lo is not None or hi is not None:
+    if eqs:
+        # point scan on the first equality; every other pk factor (further
+        # equalities, ranges) is demoted into the residual so contradictory
+        # conjunctions still filter correctly
+        demoted = [f for _, f in eqs[1:]]
+        demoted += [f for _, _, f in lo_list]
+        demoted += [f for _, _, f in hi_list]
+        return lambda t: IndexPointScanOperator(t, eqs[0][0]), residual + demoted
+
+    if lo_list or hi_list:
+        lo, lo_inc = _tighten([(v, inc) for v, inc, _ in lo_list], lower=True)
+        hi, hi_inc = _tighten([(v, inc) for v, inc, _ in hi_list], lower=False)
+        # the tightened range implies every individual range factor, so they
+        # are all consumed; only non-pk factors stay in the residual
         return (
             lambda t: IndexRangeScanOperator(t, lo, lo_inc, hi, hi_inc),
             residual,

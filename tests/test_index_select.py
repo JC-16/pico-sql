@@ -145,3 +145,122 @@ def test_index_persistence_via_rebuild(tmp_path):
     assert db2.last_scan_used_index is True
     assert res.rows == [[50]]
     db2.close()
+
+
+# ------------------------------------------ adversarial regressions (Day 3)
+
+
+def test_planner_neq_is_never_a_bound():
+    """BUG-A regression: 'id != 5' was mis-planned as an upper bound and
+    silently dropped every row above 5."""
+    db = make_db(50)
+    plan, residual = _extract_pk_plan(db.tables["t"], factors_of(db, "id != 25"))
+    assert plan is None  # a disequality is not a range bound
+    assert len(residual) == 1
+    (res,) = db.execute_sql("SELECT id FROM t WHERE id != 25")
+    assert db.last_scan_used_index is False
+    assert [r[0] for r in res.rows] == [i for i in range(50) if i != 25]
+
+
+def test_planner_tightens_multiple_lower_bounds():
+    """BUG-B regression: the looser bound used to overwrite the tighter one."""
+    db = make_db(50)
+    (res,) = db.execute_sql("SELECT id FROM t WHERE id > 10 AND id > 20")
+    assert db.last_scan_used_index is True
+    assert [r[0] for r in res.rows] == list(range(21, 50))
+    # looser bound written first, tighter second -- order must not matter
+    (res,) = db.execute_sql("SELECT id FROM t WHERE id > 20 AND id > 10")
+    assert [r[0] for r in res.rows] == list(range(21, 50))
+    # inclusivity: a strict bound wins over an inclusive tie
+    (res,) = db.execute_sql("SELECT id FROM t WHERE id >= 20 AND id > 20")
+    assert [r[0] for r in res.rows] == list(range(21, 50))
+
+
+def test_planner_tightens_multiple_upper_bounds():
+    db = make_db(50)
+    (res,) = db.execute_sql("SELECT id FROM t WHERE id < 30 AND id <= 20")
+    assert db.last_scan_used_index is True
+    assert [r[0] for r in res.rows] == list(range(21))
+
+
+def test_planner_contradictory_equalities_return_nothing():
+    db = make_db(50)
+    (res,) = db.execute_sql("SELECT id FROM t WHERE id = 5 AND id = 6")
+    assert res.rows == []
+    (res,) = db.execute_sql("SELECT id FROM t WHERE id = 5 AND id = 5")
+    assert res.rows == [[5]]
+
+
+def test_planner_eq_vs_range_contradiction_returns_nothing():
+    db = make_db(50)
+    (res,) = db.execute_sql("SELECT id FROM t WHERE id = 2 AND id > 3")
+    assert res.rows == []
+    (res,) = db.execute_sql("SELECT id FROM t WHERE id = 5 AND id > 3")
+    assert res.rows == [[5]]  # consistent eq+range still returns the row
+
+
+# --------------------------------------- executable oracle: planner vs scan
+
+
+def test_planner_differential_random_where():
+    """The anti-leniency oracle: for 600 random WHERE conjunctions, the
+    index-planned pipeline must return exactly what a brute-force full scan
+    of the same predicate returns. This class of test exists because
+    self-review of one's own planner cannot be trusted to catch planner
+    logic errors -- the two bugs this file locks in were both invisible to
+    hand-written single-case tests."""
+    import random
+
+    from picosql import ast as ast_mod
+    from picosql.engine import _combine_conjunction, _where_pass, eval_expr
+    from picosql.executor import SeqScanOperator
+
+    rng = random.Random(99)
+    db = make_db(120)
+    table = db.tables["t"]
+    ops = ["=", "!=", "<", "<=", ">", ">="]
+
+    for _trial in range(600):
+        factors = []
+        for _ in range(rng.randint(1, 3)):
+            op = rng.choice(ops)
+            value = rng.randint(0, 130)
+            col = ast_mod.ColumnRef("id")
+            lit = ast_mod.Literal(value)
+            if rng.random() < 0.5:
+                factors.append(ast_mod.BinaryOp(op, col, lit))
+            else:  # mirrored form
+                factors.append(ast_mod.BinaryOp(op, lit, col))
+        if rng.random() < 0.3:
+            factors.append(
+                ast_mod.BinaryOp(
+                    "=", ast_mod.ColumnRef("grp"), ast_mod.Literal(rng.randint(0, 12))
+                )
+            )
+
+        # ground truth: brute-force evaluation of the whole conjunction
+        full_expr = _combine_conjunction(factors)
+        expected = sorted(
+            row[0]
+            for _, row in table.store.scan()
+            if _where_pass(eval_expr(full_expr, row, table))
+        )
+
+        # actual: the planner's index pipeline, built exactly the way
+        # _execute_select builds it
+        plan, residual_factors = _extract_pk_plan(table, factors)
+        scan = plan(table) if plan else SeqScanOperator(table)
+        residual = _combine_conjunction(residual_factors)
+        from picosql.executor import FilterOperator
+
+        op_pipe = scan
+        if residual is not None:
+            op_pipe = FilterOperator(
+                op_pipe, lambda row: _where_pass(eval_expr(residual, row, table))
+            )
+        actual = sorted(row[0] for row in op_pipe.drain())
+
+        assert actual == expected, (
+            f"planner mismatch for factors {[f.op for f in factors]}: "
+            f"{actual[:10]}... != {expected[:10]}..."
+        )
