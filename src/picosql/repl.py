@@ -12,7 +12,7 @@ from .engine import Database, EngineError, ExecuteResult, QueryResult
 from .lexer import SqlError
 from .parser import parse
 
-BANNER = "pico-sql v0.4.0 -- a tiny SQL engine for learning (.help for help)"
+BANNER = "pico-sql v1.0.0 -- a tiny SQL engine for learning (.help for help)"
 
 HELP = (
     ".quit              exit (works even with a pending statement)\n"

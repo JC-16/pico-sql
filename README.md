@@ -24,24 +24,25 @@ pico-sql 是一个教学向的关系型数据库引擎：不接受任何数据�
 | B+ 树索引 | ✅ Day 3 | 分裂/合并/借用全套、叶子链范围扫描、4000 次随机对拍 |
 | 火山模型执行器 | ✅ Day 3 | Open/Next/Close 管线 + WHERE 主键索引下推（点查/范围） |
 | WAL 预写日志 + 崩溃恢复 | ✅ Day 4 | 语句提交即 fsync；真 kill -9 崩溃恢复测试 |
-| 性能基准 | ✅ Day 4 | 索引点查 vs 全表扫描：**9× 加速**（2000 行，见下图） |
+| 性能基准 | ✅ Day 4 | 索引点查 vs 全表扫描：**174× 加速**（2000 行，见下图） |
 
 ![benchmark](docs/benchmark.png)
 
 ## 快速开始
 
+要求：Python 3.9+（开发与测试在 3.12 上进行）。
+
 ```bash
 git clone https://github.com/JC-16/pico-sql.git
 cd pico-sql
 pip install -e .[dev]
-python -m picosql
+python -m picosql demo.pico
 ```
 
-一个真实的会话（带持久化）：
+一个真实的会话（数据持久化到 `demo.pico`）：
 
 ```
-> python -m picosql demo.pico
-pico-sql v0.1.0 -- a tiny SQL engine for learning (.help for help) [db: demo.pico]
+pico-sql v1.0.0 -- a tiny SQL engine for learning (.help for help) [db: demo.pico]
 pico-sql> CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(20), score FLOAT);
 table 'users' created
 pico-sql> INSERT INTO users VALUES (1, 'alice', 91.5), (2, 'bob', 72.0);
@@ -78,16 +79,41 @@ db.execute_sql("SELECT * FROM t WHERE grp = 7")     # 非主键列：全表扫�
 跑测试：
 
 ```bash
-pytest -q   # 130 tests：B+ 树 4000 次随机对拍、规划器 600 次随机对拍、
-            # 火山管线惰性证明、崩溃恢复/损坏目录/REPL 边界的加固回归
+pytest -q   # 143 tests：B+ 树 4000 次随机对拍、规划器 600 次随机对拍、
+            # 火山管线惰性证明、kill -9 崩溃恢复、损坏目录/REPL 边界的加固回归
 ```
 
-## 架构（目标形态）
+## 项目结构
+
+```
+pico-sql/
+├── src/picosql/
+│   ├── lexer.py          # 词法分析：字符流 → Token 流（带行列号）
+│   ├── ast.py            # SQL AST 节点（frozen dataclass）
+│   ├── parser.py         # 递归下降语法分析：Token 流 → AST
+│   ├── engine.py         # 执行器 + 索引规划器 + Database 门面
+│   ├── executor.py       # 火山模型算子族（Open/Next/Close）
+│   ├── repl.py           # 交互式终端（可注入 I/O，便于测试）
+│   └── storage/
+│       ├── pages.py      # Slotted Page：4KB 页、槽目录、墓碑、页内压缩
+│       ├── record.py     # 行 ↔ 字节编解码（NULL 标志、变长 VARCHAR）
+│       ├── bufferpool.py # LRU 缓冲池 + 内存/磁盘页文件
+│       ├── heap.py       # 堆表：first-fit 插入、row_id 语义
+│       ├── btree.py      # B+ 树索引：分裂/借用/合并、叶子链范围扫描
+│       ├── wal.py        # 预写日志：全页镜像重做、crc32 帧、检查点
+│       ├── catalog.py    # 目录页（页 0，JSON）
+│       └── lockfile.py   # 单写者实例锁（进程死亡自动释放）
+├── tests/                # 143 个测试（含随机对拍与真进程崩溃测试）
+├── benchmarks/           # 性能基准脚本（可复现）
+└── docs/design.md        # 架构设计、文法、每个决策的理由、演进日志
+```
+
+## 架构
 
 ```mermaid
 flowchart TB
-    REPL["REPL (repl.py)"] --> Parser["Parser (parser.py)<br/>递归下降"]
-    Parser -->|tokens| Lexer["Lexer (lexer.py)"]
+    REPL["REPL (repl.py)"] -->|SQL 文本| Parser["Parser (parser.py)<br/>递归下降"]
+    Lexer["Lexer (lexer.py)"] -->|tokens| Parser
     Parser -->|AST| Executor["Executor<br/>火山模型 (Day 3)"]
     Executor --> BTree["B+ Tree Index (Day 3)"]
     Executor --> Pool["Buffer Pool<br/>LRU (Day 2)"]
@@ -97,7 +123,7 @@ flowchart TB
     WAL --> Disk
 ```
 
-图中带 Day 标注的模块按路线表逐日落地，未完成项见上方状态表的 ⏳——本仓库的 commit 历史就是实现顺序本身。
+图中 Day 标注记录了每个模块落地的时间——本仓库的 commit 历史就是实现顺序本身。
 
 ## SQL 子集
 

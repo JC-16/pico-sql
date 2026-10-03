@@ -4,13 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "picosql"
-version = "0.4.0"
+version = "1.0.0"
 description = "A tiny relational database engine in pure Python, built to learn how real databases work."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "JasonChung" }]
-keywords = ["database", "sql", "learning", "btree", "wal"]
+keywords = ["database", "sql", "learning", "btree", "wal", "storage-engine"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Intended Audience :: Education",
+]
+
+[project.urls]
+Repository = "https://github.com/JC-16/pico-sql"
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "ruff>=0.4"]
