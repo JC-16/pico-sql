@@ -7,7 +7,7 @@ from .engine import Database, EngineError, ExecuteResult, QueryResult
 from .lexer import SqlError, Token, tokenize
 from .parser import parse
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Database",

@@ -35,8 +35,15 @@ from .storage.btree import BPlusTree, BTreeError
 from .storage.bufferpool import BufferPool, FilePageFile, MemoryPageFile
 from .storage.catalog import load_catalog, save_catalog
 from .storage.heap import HeapTable
-from .storage.pages import PageError, new_page
+from .storage.pages import (
+    HEADER_SIZE,
+    PAGE_SIZE,
+    SLOT_SIZE,
+    PageError,
+    new_page,
+)
 from .storage.record import encode_row
+from .storage.wal import WalError, WriteAheadLog
 
 INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
@@ -368,8 +375,13 @@ def _execute_insert(db: "Database", stmt: ast.Insert) -> ExecuteResult:
             values[table.col_pos(col.name)] = table._coerce(
                 col, eval_expr(expr, None, table)
             )
-        encode_row(table.columns, values)  # surfaces overflow / oversize NOW,
-        # not as a raw struct.error or a mid-statement storage failure
+        encoded = encode_row(table.columns, values)
+        if len(encoded) > PAGE_SIZE - HEADER_SIZE - SLOT_SIZE:
+            # trial-encode passes the codec but the row can never live in a
+            # page -- reject it in phase 1, BEFORE phase 2 starts writing
+            raise EngineError(
+                f"row needs {len(encoded)} bytes and cannot fit in one page"
+            )
         staged.append(values)
     if pk_pos is not None:
         seen: set = set()
@@ -571,8 +583,11 @@ def _execute_update(db: "Database", stmt: ast.Update) -> ExecuteResult:
         new_row = list(row)
         for pos, expr in positions.items():
             new_row[pos] = table._coerce(table.columns[pos], eval_expr(expr, row, table))
-        encode_row(table.columns, new_row)  # oversize/overflow fails HERE,
-        # before any row is written -- same all-or-nothing rule as INSERT
+        encoded = encode_row(table.columns, new_row)
+        if len(encoded) > PAGE_SIZE - HEADER_SIZE - SLOT_SIZE:
+            raise EngineError(
+                f"row needs {len(encoded)} bytes and cannot fit in one page"
+            )
         if pk_pos is not None:
             old_value, new_value = row[pk_pos], new_row[pk_pos]
             if old_value != new_value and new_value is not None:
@@ -631,6 +646,15 @@ class Database:
         )
         self.pool = BufferPool(self.page_file, buffer_capacity)
         self._closed = False
+        self._poisoned = False
+        self._commits_since_checkpoint = 0
+        # File mode gets a WAL: anything that returns from execute() is
+        # fsynced into the log before the caller sees success, so a crash
+        # can never lose a committed statement. Memory mode is ephemeral by
+        # definition -- nothing to recover, nothing to log.
+        self._wal = None if path is None else WriteAheadLog(Path(str(path) + ".wal"))
+        if self._wal is not None:
+            self._recover_from_wal()
         try:
             self.catalog = load_catalog(self.pool)
         except PageError as exc:
@@ -639,28 +663,91 @@ class Database:
             raise EngineError(f"cannot open database: {exc}") from None
         self.free_pages: list = list(self.catalog.get("free_pages", []))
         self.tables: dict = {}
-        self.last_scan_used_index = None  # set by every SELECT (planner output)
         for name, entry in self.catalog["tables"].items():
             columns = [Column.from_dict(c) for c in entry["columns"]]
-            store = HeapTable(self.pool, entry["page_ids"], columns, alloc_hook=self._alloc_page)
+            store = HeapTable(
+                self.pool, entry["page_ids"], columns, alloc_hook=self._alloc_page
+            )
             table = Table(name, columns, store)
             table.rebuild_pk_index()
             self.tables[name] = table
+        self.last_scan_used_index = None  # set by every SELECT (planner output)
+
+    def _recover_from_wal(self) -> int:
+        """Replay committed records into the data file, then truncate the log.
+
+        Returns the number of records applied (0 = the log was empty; nothing
+        to recover).
+        """
+        applied = 0
+        for _lsn, pages in self._wal.replay():
+            for page_id, image in pages:
+                while page_id >= self.page_file.num_pages:
+                    self.page_file.alloc_page()
+                self.page_file.write_page(page_id, image)
+            applied += 1
+        if applied:
+            self.page_file.sync()
+            self._wal.truncate()  # redo applied: the log is redundant again
+        return applied
+
+    def _wal_commit(self) -> None:
+        """Autocommit: fsync a full-page-image record of every dirty page.
+
+        The catalog is re-serialized FIRST (page_ids and the free list change
+        on every allocation), then all dirty pages are snapshotted -- page 0
+        among them, so the log always carries the catalog that matches the
+        data pages. Snapshotting ALL dirty pages (not just this statement's)
+        is correct: their current images are the last committed state, and
+        redo replays in order, so the newest image always wins.
+        """
+        if self._wal is None:
+            return
+        self._save_catalog()
+        dirty = sorted(self.pool.dirty_page_ids())
+        if not dirty:
+            return
+        images = [(page_id, bytes(self.pool.get(page_id))) for page_id in dirty]
+        try:
+            self._wal.append_commit(images)
+        except WalError as exc:
+            # the statement applied in memory but is NOT durable -- the only
+            # safe move is to fail the instance; reopening replays the last
+            # committed state and discards this work
+            self._poisoned = True
+            raise EngineError(f"commit failed: {exc}") from None
+        self._commits_since_checkpoint += 1
+        if self._commits_since_checkpoint >= 32:
+            self.checkpoint()
+
+    def checkpoint(self) -> None:
+        """Mid-session checkpoint: flush every dirty page to the data file,
+        fsync, then truncate the WAL (redundant once pages are durable)."""
+        if self._closed or self._poisoned:
+            return
+        self._flush_and_truncate()
+
+    def _flush_and_truncate(self) -> None:
+        self.pool.flush_all()
+        self.page_file.sync()
+        self._commits_since_checkpoint = 0
+        if self._wal is not None:
+            self._wal.truncate()
 
     def _alloc_page(self) -> int:
         """Allocate a page for table data: recycle dropped pages first.
 
         Both fresh and recycled pages are (re-)initialized with a valid
         header -- a recycled page still carries the dropped table's data
-        until every byte of it happens to be overwritten.
+        until every byte of it happens to be overwritten. The catalog is
+        NOT serialized here: _wal_commit serializes it after the caller has
+        updated page_ids, so the logged image is always current.
         """
         recycled = bool(self.free_pages)
         page_id = self.free_pages.pop(0) if recycled else self.pool.page_file.alloc_page()
         page = self.pool.get(page_id)
         page[:] = bytes(new_page(page_id))
         self.pool.mark_dirty(page_id)
-        if recycled:
-            self._save_catalog()
         return page_id
 
     def _save_catalog(self) -> None:
@@ -683,26 +770,49 @@ class Database:
     def execute(self, stmt):
         if self._closed:
             raise EngineError("database is closed")
+        if self._poisoned:
+            raise EngineError(
+                "database is in a failed state; close and reopen to recover "
+                "the last committed state"
+            )
         try:
-            return _DISPATCH[type(stmt)](self, stmt)
+            result = _DISPATCH[type(stmt)](self, stmt)
         except PageError as exc:
+            # a storage failure mid-statement may have left partial changes
+            # in the buffer pool: poison the instance so those uncommitted
+            # pages are never flushed; reopening replays the WAL instead
+            self._poisoned = True
             raise EngineError(str(exc)) from None
         except BTreeError as exc:
+            self._poisoned = True
             raise EngineError(str(exc)) from None
         except RecursionError:
+            self._poisoned = True
             raise EngineError("expression too deeply nested") from None
+        self._wal_commit()
+        return result
 
     def execute_sql(self, text: str) -> list:
         """Parse and run a whole script; returns one result per statement."""
         return [self.execute(stmt) for stmt in parse(text)]
 
     def close(self) -> None:
-        """Flush dirty pages and persist the catalog. Idempotent."""
+        """Checkpoint (flush + fsync + WAL truncate) and close. Idempotent.
+
+        A poisoned instance discards its dirty pages instead of flushing
+        them: uncommitted work must never reach the data file. Reopening
+        replays the WAL to the last committed state.
+        """
         if self._closed:
             return
+        if self._poisoned:
+            self._closed = True
+            self.pool.discard()
+            self.page_file.close()
+            return
+        self._save_catalog()  # capture the final catalog (page_ids, free list)
+        self._flush_and_truncate()
         self._closed = True
-        self._save_catalog()
-        self.pool.close()  # flush all dirty pages + fsync
         self.page_file.close()
 
 

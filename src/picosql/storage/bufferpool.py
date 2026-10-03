@@ -196,6 +196,19 @@ class BufferPool:
             self.page_file.write_page(page_id, bytes(self._pages[page_id]))
         self._dirty.clear()
 
+    def discard(self) -> None:
+        """Drop every cached page and dirty flag WITHOUT writing anything.
+
+        Used when an instance is poisoned: uncommitted pages must never
+        reach the data file.
+        """
+        self._check_open()
+        self._pages.clear()
+        self._dirty.clear()
+
+    def dirty_page_ids(self) -> frozenset:
+        return frozenset(self._dirty)
+
     @property
     def dirty_count(self) -> int:
         return len(self._dirty)

@@ -188,7 +188,7 @@ def test_update_oversize_varchar_is_atomic():
         INSERT INTO t VALUES (1, 'short'), (2, 'also short');
         """
     )
-    with pytest.raises(EngineError, match="never fit"):
+    with pytest.raises(EngineError, match="cannot fit in one page"):
         db.execute_sql(f"UPDATE t SET note = '{'x' * 5000}' WHERE id >= 1")
     (res,) = db.execute_sql("SELECT note FROM t ORDER BY id")
     assert res.rows == [["short"], ["also short"]]  # no partial commit
