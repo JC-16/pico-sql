@@ -156,6 +156,13 @@ class BufferPool:
         self.hits = 0
         self.misses = 0
         self._closed = False
+        # WAL support: a monotonically increasing counter, bumped on every
+        # mark_dirty, plus per-page "serial at last dirtied time". The engine
+        # compares max(serial) with the serial it last logged to decide
+        # whether anything needs a commit record -- the per-page-LSN idea
+        # reduced to one global counter.
+        self._serial = 0
+        self._page_serial: dict = {}
 
     def _check_open(self) -> None:
         if self._closed:
@@ -179,22 +186,27 @@ class BufferPool:
         if page_id in self._dirty:
             self.page_file.write_page(page_id, bytes(page))
             self._dirty.discard(page_id)
+        self._page_serial.pop(page_id, None)  # durable: no logging needed
 
     def mark_dirty(self, page_id: int) -> None:
         self._check_open()
         if page_id not in self._pages:
             raise PageError(f"cannot mark non-resident page {page_id} dirty")
         self._dirty.add(page_id)
+        self._serial += 1
+        self._page_serial[page_id] = self._serial
 
     def flush(self, page_id: int) -> None:
         if page_id in self._pages and page_id in self._dirty:
             self.page_file.write_page(page_id, bytes(self._pages[page_id]))
             self._dirty.discard(page_id)
+        self._page_serial.pop(page_id, None)  # durable: no logging needed
 
     def flush_all(self) -> None:
         for page_id in list(self._dirty):
             self.page_file.write_page(page_id, bytes(self._pages[page_id]))
         self._dirty.clear()
+        self._page_serial.clear()
 
     def discard(self) -> None:
         """Drop every cached page and dirty flag WITHOUT writing anything.
@@ -205,9 +217,17 @@ class BufferPool:
         self._check_open()
         self._pages.clear()
         self._dirty.clear()
+        self._page_serial.clear()
 
     def dirty_page_ids(self) -> frozenset:
         return frozenset(self._dirty)
+
+    def max_dirty_serial(self) -> int:
+        """Highest mark_dirty serial among currently dirty pages."""
+        return max(self._page_serial.values(), default=0)
+
+    def current_serial(self) -> int:
+        return self._serial
 
     @property
     def dirty_count(self) -> int:

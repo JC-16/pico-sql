@@ -35,6 +35,7 @@ from .storage.btree import BPlusTree, BTreeError
 from .storage.bufferpool import BufferPool, FilePageFile, MemoryPageFile
 from .storage.catalog import load_catalog, save_catalog
 from .storage.heap import HeapTable
+from .storage.lockfile import InstanceLock
 from .storage.pages import (
     HEADER_SIZE,
     PAGE_SIZE,
@@ -334,7 +335,7 @@ def _execute_create(db: "Database", stmt: ast.CreateTable) -> ExecuteResult:
     columns = [Column(c) for c in stmt.columns]
     store = HeapTable(db.pool, [], columns, alloc_hook=db._alloc_page)
     db.tables[stmt.table] = Table(stmt.table, columns, store)
-    db._save_catalog()
+    db._catalog_dirty = True  # serialized by the commit that follows
     return ExecuteResult(f"table {stmt.table!r} created")
 
 
@@ -345,7 +346,7 @@ def _execute_drop(db: "Database", stmt: ast.DropTable) -> ExecuteResult:
     # recycle the table's pages for future tables; old bytes linger until
     # each page is reused -- same visibility tradeoff real engines make
     db.free_pages.extend(table.store.page_ids)
-    db._save_catalog()
+    db._catalog_dirty = True  # serialized by the commit that follows
     return ExecuteResult(f"table {stmt.table!r} dropped")
 
 
@@ -641,25 +642,37 @@ class Database:
     """
 
     def __init__(self, path=None, buffer_capacity: int = 64):
-        self.page_file = (
-            MemoryPageFile() if path is None else FilePageFile(Path(path))
-        )
-        self.pool = BufferPool(self.page_file, buffer_capacity)
         self._closed = False
         self._poisoned = False
         self._commits_since_checkpoint = 0
-        # File mode gets a WAL: anything that returns from execute() is
-        # fsynced into the log before the caller sees success, so a crash
-        # can never lose a committed statement. Memory mode is ephemeral by
-        # definition -- nothing to recover, nothing to log.
-        self._wal = None if path is None else WriteAheadLog(Path(str(path) + ".wal"))
-        if self._wal is not None:
-            self._recover_from_wal()
+        self._catalog_dirty = False  # page_ids / free list changed since the
+        # catalog page was last serialized
+        self._lock = None
+        self.page_file = None
+        self.pool = None
+        self._wal = None
+        self._last_logged_serial = 0
+        if path is None:
+            # Memory mode: ephemeral by design -- nothing to recover, lock,
+            # or log.
+            self.page_file = MemoryPageFile()
+        else:
+            # Single-writer: an OS-level lock (released by the process's
+            # death) guards against a second instance corrupting the file
+            # or truncating a live writer's log.
+            try:
+                self._lock = InstanceLock(Path(str(path) + ".lock"))
+                self.page_file = FilePageFile(Path(path))
+                self._wal = WriteAheadLog(Path(str(path) + ".wal"))
+                self._recover_from_wal()
+            except (PageError, WalError) as exc:
+                self._close_handles()
+                raise EngineError(f"cannot open database: {exc}") from None
+        self.pool = BufferPool(self.page_file, buffer_capacity)
         try:
             self.catalog = load_catalog(self.pool)
         except PageError as exc:
-            self.pool.close()
-            self.page_file.close()
+            self._close_handles()
             raise EngineError(f"cannot open database: {exc}") from None
         self.free_pages: list = list(self.catalog.get("free_pages", []))
         self.tables: dict = {}
@@ -673,11 +686,32 @@ class Database:
             self.tables[name] = table
         self.last_scan_used_index = None  # set by every SELECT (planner output)
 
-    def _recover_from_wal(self) -> int:
-        """Replay committed records into the data file, then truncate the log.
+    def _close_handles(self) -> None:
+        """Best-effort cleanup of whatever was opened; safe on partial init."""
+        pool = getattr(self, "pool", None)
+        if pool is not None:
+            try:
+                pool.close()
+            except PageError:
+                pass
+        page_file = getattr(self, "page_file", None)
+        if page_file is not None:
+            try:
+                page_file.close()
+            except PageError:
+                pass
+        if getattr(self, "_lock", None) is not None:
+            self._lock.release()
 
-        Returns the number of records applied (0 = the log was empty; nothing
-        to recover).
+    def _recover_from_wal(self) -> int:
+        """Replay committed records into the data file. Returns the number of
+        records applied (0 = the log was empty; nothing to recover).
+
+        Recovery NEVER truncates the log: replay is idempotent (rewriting the
+        same committed images converges to the last committed state), and a
+        live writer's unflushed commits are still protected only by those
+        records. Truncation belongs exclusively to the checkpoint of the
+        instance that owns the log.
         """
         applied = 0
         for _lsn, pages in self._wal.replay():
@@ -688,22 +722,31 @@ class Database:
             applied += 1
         if applied:
             self.page_file.sync()
-            self._wal.truncate()  # redo applied: the log is redundant again
         return applied
 
     def _wal_commit(self) -> None:
         """Autocommit: fsync a full-page-image record of every dirty page.
 
-        The catalog is re-serialized FIRST (page_ids and the free list change
-        on every allocation), then all dirty pages are snapshotted -- page 0
-        among them, so the log always carries the catalog that matches the
-        data pages. Snapshotting ALL dirty pages (not just this statement's)
-        is correct: their current images are the last committed state, and
-        redo replays in order, so the newest image always wins.
+        Read-only statements skip the log entirely (no dirty pages, no catalog
+        change -> nothing to protect). When the catalog changed (page_ids or
+        the free list moved), it is re-serialized FIRST so page 0 is snapshotted
+        together with the data pages -- the log always carries the catalog
+        that matches the data pages. Snapshotting ALL dirty pages (not just
+        this statement's) is correct: their current images are the last
+        committed state, and redo replays in order, so the newest image wins.
         """
         if self._wal is None:
             return
-        self._save_catalog()
+        # page-serial check: skip entirely when no dirty page has been
+        # touched since the last commit record (e.g. plain SELECTs) -- this
+        # is the per-page LSN idea, reduced to one global counter
+        if (
+            self.pool.max_dirty_serial() <= self._last_logged_serial
+            and not self._catalog_dirty
+        ):
+            return
+        if self._catalog_dirty:
+            self._save_catalog()  # re-serializes page 0 and marks it dirty
         dirty = sorted(self.pool.dirty_page_ids())
         if not dirty:
             return
@@ -716,6 +759,7 @@ class Database:
             # committed state and discards this work
             self._poisoned = True
             raise EngineError(f"commit failed: {exc}") from None
+        self._last_logged_serial = self.pool.current_serial()
         self._commits_since_checkpoint += 1
         if self._commits_since_checkpoint >= 32:
             self.checkpoint()
@@ -748,6 +792,7 @@ class Database:
         page = self.pool.get(page_id)
         page[:] = bytes(new_page(page_id))
         self.pool.mark_dirty(page_id)
+        self._catalog_dirty = True  # page_ids gains an entry at commit time
         return page_id
 
     def _save_catalog(self) -> None:
@@ -760,6 +805,7 @@ class Database:
         }
         self.catalog["free_pages"] = self.free_pages
         save_catalog(self.pool, self.catalog)
+        self._catalog_dirty = False
 
     def _require_table(self, name: str) -> Table:
         table = self.tables.get(name)
@@ -809,11 +855,16 @@ class Database:
             self._closed = True
             self.pool.discard()
             self.page_file.close()
+            if self._lock is not None:
+                self._lock.release()
             return
-        self._save_catalog()  # capture the final catalog (page_ids, free list)
+        if self._catalog_dirty:
+            self._save_catalog()  # capture the final catalog (page_ids, free list)
         self._flush_and_truncate()
         self._closed = True
         self.page_file.close()
+        if self._lock is not None:
+            self._lock.release()
 
 
 __all__ = [

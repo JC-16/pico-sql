@@ -118,22 +118,24 @@ DELETE FROM users WHERE id = 3;
 
 ```
 rows inserted          : 2000
-insert wall time       : 2.35s (WAL fsync per 100-row statement)
-PK point query (index) : 1882.4 µs/query
-same query, full scan  : 16139.7 µs/query
-speedup                : 9x
+insert wall time       : 2.39s (WAL fsync per 100-row statement)
+PK point query (index) : 81.6 µs/query
+same query, full scan  : 14194.9 µs/query
+speedup                : 174x
 ```
 
 绝对数值由 Python 解释器与虚拟机环境主导，**比值才是重点**：2000 行规模下
-B+ 树点查比全表扫描快约 9 倍，且差距随数据量增长（全扫 O(n)，树查 O(log n)）。
-复现命令：`python benchmarks/benchmark.py`（可自行在你机器上跑出你的数字）。
+B+ 树点查比全表扫描快约 174 倍，且差距随数据量增长（全扫 O(n)，树查
+O(log n)）。复现命令：`python benchmarks/benchmark.py`。
+（诚实记录：审查前的首测只有 9×——当时的测量被"SELECT 也写 WAL 并 fsync"
+的缺陷灌了水，修复缺陷后才是索引的真实收益。）
 
 ## Known Limitations（诚实清单）
 
 - **持久化语义**：语句提交时全页镜像写入 WAL 并 fsync（提交即持久）；崩溃后重放恢复到上一个已提交状态。恢复按页镜像整体重写，未实现增量重放/回滚段
 - **中毒实例**：语句在写阶段意外失败（磁盘满等）后，实例进入失败状态并拒绝后续操作；close 丢弃未提交脏页，重开即恢复到最后已提交状态
 - **PRIMARY KEY 允许 NULL**（与标准 SQL 的"主键隐含 NOT NULL"不同），且多个 NULL 主键互不冲突（各自不入索引）；有测试固化此偏差
-- **无文件锁**：两个进程同时打开同一数据库文件会互相覆盖（真实引擎有实例锁/锁页）
+- **单写者锁**：同一时刻只允许一个实例打开数据库（OS 级锁，进程死亡自动释放）；并发读写连接不支持
 - 页 0 的目录（catalog）用 JSON 存储（真实数据库用专用二进制页 + 事务性更新）；单页 4KB 限制 schema 总量
 - 主键 B+ 树索引常驻内存、不持久化，每次打开时从数据页重建（量大时启动变慢）
 - **索引下推范围有限**：仅主键单列；`!=`、OR、列间比较、ORDER BY 均不走索引

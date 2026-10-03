@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -67,23 +68,20 @@ def test_truncate_resets_the_log(tmp_path):
 # --------------------------------------------------- engine-level durability
 
 
-def test_committed_statements_survive_without_close(tmp_path):
-    """The Day 2 gap, closed: another instance sees committed rows even
-    though the writer never called close()."""
+def test_second_instance_is_locked_out_and_released_on_close(tmp_path):
+    """Single-writer guarantee: a second Database on the same file is
+    refused while the first is open; a clean close releases the lock."""
     path = tmp_path / "live.pico"
     writer = Database(path)
     writer.execute_sql("CREATE TABLE t (id INT PRIMARY KEY, v INT);")
     writer.execute_sql("INSERT INTO t VALUES (1, 10);")
-    reader = Database(path)  # opens while the writer is still open
-    (res,) = reader.execute_sql("SELECT id, v FROM t")
-    assert res.rows == [[1, 10]]
-    reader.close()
-    writer.execute_sql("INSERT INTO t VALUES (2, 20);")
-    reader2 = Database(path)
-    (res,) = reader2.execute_sql("SELECT id FROM t ORDER BY id")
-    assert [r[0] for r in res.rows] == [1, 2]
-    reader2.close()
+    with pytest.raises(EngineError, match="locked"):
+        Database(path)
     writer.close()
+    db2 = Database(path)  # clean close released the lock
+    (res,) = db2.execute_sql("SELECT id FROM t")
+    assert res.rows == [[1]]
+    db2.close()
 
 
 def test_checkpoint_truncates_wal_and_data_remains(tmp_path):
@@ -107,9 +105,11 @@ def test_recovery_replays_after_simulated_crash(tmp_path):
     writer = Database(path)
     writer.execute_sql("CREATE TABLE t (id INT PRIMARY KEY, v INT);")
     writer.execute_sql("INSERT INTO t VALUES (1, 11), (2, 22);")
-    # discard the writer WITHOUT flushing: buffers die, WAL survives
-    writer._closed = True  # pretend the process vanished
+    # simulate the process vanishing: the OS would release the instance lock
+    # on death; in-process we release it explicitly
+    writer._closed = True
     writer.pool.discard()
+    writer._lock.release()
 
     db = Database(path)  # opens -> replays WAL -> state restored
     (res,) = db.execute_sql("SELECT id, v FROM t ORDER BY id")
@@ -218,4 +218,24 @@ def test_memory_mode_has_no_wal():
     assert db._wal is None
     db.execute_sql("CREATE TABLE t (id INT PRIMARY KEY);")
     db.execute_sql("INSERT INTO t VALUES (1);")
+    db.close()
+
+
+# --------------------------------------- second-pass adversarial regressions
+
+
+def test_select_never_appends_wal_records(tmp_path):
+    """BUG-D regression: read-only statements used to write commit records
+    (catalog re-serialization) and pay an fsync each."""
+    path = tmp_path / "ro.pico"
+    wal_path = Path(str(path) + ".wal")
+    db = Database(path)
+    db.execute_sql("CREATE TABLE t (id INT PRIMARY KEY, v INT);")
+    db.execute_sql("INSERT INTO t VALUES (1, 1), (2, 2);")
+    size_after_writes = wal_path.stat().st_size
+    assert size_after_writes > 0
+
+    for _ in range(10):
+        db.execute_sql("SELECT * FROM t WHERE id = 1")
+    assert wal_path.stat().st_size == size_after_writes  # reads log nothing
     db.close()
