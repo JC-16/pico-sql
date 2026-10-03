@@ -12,7 +12,7 @@ from .engine import Database, EngineError, ExecuteResult, QueryResult
 from .lexer import SqlError
 from .parser import parse
 
-BANNER = "pico-sql v1.0.0 -- a tiny SQL engine for learning (.help for help)"
+BANNER = "pico-sql v1.0.0 -- a minimal SQL engine implemented from scratch (.help for help)"
 
 HELP = (
     ".quit              exit (works even with a pending statement)\n"
@@ -127,7 +127,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="pico-sql",
-        description="A tiny SQL engine for learning how databases work.",
+        description="A minimal SQL engine implemented from scratch in pure Python.",
     )
     parser.add_argument(
         "file",

@@ -289,7 +289,7 @@ def _eval_arith(op: str, left: Any, right: Any) -> Any:
     # op == "%"
     if right == 0:
         raise EngineError("division by zero")
-    return left % right  # Python semantics for negatives; see STUDY.md
+    return left % right  # Python semantics for negatives (differs from C)
 
 
 def _eval_compare(op: str, left: Any, right: Any) -> Any:

@@ -1,4 +1,4 @@
-"""pico-sql: a tiny relational database engine in pure Python, for learning.
+"""pico-sql: a minimal relational database engine implemented from scratch in pure Python.
 
 Pipeline: text --tokenize--> tokens --parse--> AST --Database.execute--> results
 """

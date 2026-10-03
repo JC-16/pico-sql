@@ -4,7 +4,7 @@ The lexer is stage one of the pipeline:
 
     text --tokenize--> tokens --Parser--> AST --engine--> results
 
-Design notes (see STUDY.md for a guided tour):
+Design notes:
 * Keywords are matched case-insensitively and normalized to UPPERCASE.
 * Identifiers keep their original case.
 * Identifiers cannot start with a digit: "1abc" lexes as NUMBER(1) followed

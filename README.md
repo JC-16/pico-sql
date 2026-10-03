@@ -6,11 +6,9 @@
 
 ## 这是什么
 
-pico-sql 是一个教学向的关系型数据库引擎：不接受任何数据库库的"魔法"，
+pico-sql 是一个用纯 Python 从零实现的关系型数据库引擎：不接受任何数据库库的"魔法"，
 从**词法分析 → 语法解析 → AST → 执行器 → 存储引擎 → 崩溃恢复**，
 每一层都自己实现，最终得到一个能抗 `kill -9` 的 SQL 数据库。
-
-写它的目的只有一个：**把数据库原理课变成可以运行、可以调试、可以指着代码讲的东西。**
 
 ## 当前状态与路线图
 
@@ -42,7 +40,7 @@ python -m picosql demo.pico
 一个真实的会话（数据持久化到 `demo.pico`；输出由真实程序捕获）：
 
 ```
-pico-sql v1.0.0 -- a tiny SQL engine for learning (.help for help) [db: demo.pico]
+pico-sql v1.0.0 -- a minimal SQL engine implemented from scratch (.help for help) [db: demo.pico]
 pico-sql> CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(20), score FLOAT);
 table 'users' created
 pico-sql> INSERT INTO users VALUES (1, 'alice', 91.5), (2, 'bob', 72.0);
@@ -175,13 +173,11 @@ O(log n)）。复现命令：`python benchmarks/benchmark.py`。
 - 不支持并发客户端连接
 - 整数除法向零截断（SQL 风格），负数取模沿用 Python 语义——两处都有文档说明
 
-每一项限制在真实数据库里如何解决，见 `docs/design.md` 与 `INTERVIEW_QA.md`。
+每一项限制在真实数据库里如何解决，见 `docs/design.md`。
 
 ## 文档导航
 
-- [docs/design.md](docs/design.md) —— 架构设计、文法定义、演进日志
-- [STUDY.md](STUDY.md) —— 逐模块学习指南（含动手练习）
-- [INTERVIEW_QA.md](INTERVIEW_QA.md) —— 面试问答预演（含追问链）
+- [docs/design.md](docs/design.md) —— 架构设计、文法定义、每个决策的理由、演进日志
 
 ## License
 

@@ -8,8 +8,8 @@ followed by the payload:
     VARCHAR -> 2-byte big-endian length + UTF-8 bytes
 
 The NULL flag costs one byte per column; a real engine packs nulls into a
-bitmap (see STUDY.md Day 2 exercises). Decoding validates that the record
-is consumed exactly -- trailing bytes mean corruption.
+bitmap. Decoding validates that the record is consumed exactly -- trailing
+bytes mean corruption.
 """
 
 from __future__ import annotations
