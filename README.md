@@ -39,7 +39,7 @@ pip install -e .[dev]
 python -m picosql demo.pico
 ```
 
-一个真实的会话（数据持久化到 `demo.pico`）：
+一个真实的会话（数据持久化到 `demo.pico`；输出由真实程序捕获）：
 
 ```
 pico-sql v1.0.0 -- a tiny SQL engine for learning (.help for help) [db: demo.pico]
@@ -48,12 +48,12 @@ table 'users' created
 pico-sql> INSERT INTO users VALUES (1, 'alice', 91.5), (2, 'bob', 72.0);
 2 row(s) inserted
 pico-sql> SELECT name, score FROM users WHERE score >= 60 ORDER BY score DESC;
-+---------+-------+
-| name    | score |
-+---------+-------+
-| alice   | 91.5  |
-| bob     | 72.0  |
-+---------+-------+
++-------+-------+
+| name  | score |
++-------+-------+
+| alice | 91.5  |
+| bob   | 72.0  |
++-------+-------+
 2 row(s)
 pico-sql> .quit
 > python -m picosql demo.pico   # 重新打开，数据还在
@@ -105,7 +105,9 @@ pico-sql/
 │       └── lockfile.py   # 单写者实例锁（进程死亡自动释放）
 ├── tests/                # 143 个测试（含随机对拍与真进程崩溃测试）
 ├── benchmarks/           # 性能基准脚本（可复现）
-└── docs/design.md        # 架构设计、文法、每个决策的理由、演进日志
+└── docs/
+    ├── design.md         # 架构设计、文法、每个决策的理由、演进日志
+    └── benchmark.png     # 实测图表（由 benchmarks/benchmark.py 生成）
 ```
 
 ## 架构
